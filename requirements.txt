@@ -1,0 +1,13 @@
+tensorflow==2.10.1
+mlflow==3.15.1
+pandas
+numpy==1.23.5
+scikit-learn
+matplotlib
+nltk
+joblib
+flask
+gunicorn
+pytest
+seaborn
+requests

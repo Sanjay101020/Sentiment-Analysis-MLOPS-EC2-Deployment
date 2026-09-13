@@ -1,0 +1,361 @@
+name: Sentiment MLOps - AWS EC2 CI/CD
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sentiment-mlops-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  AWS_REGION: ap-south-1
+  ECR_REPOSITORY: sentiment-mlops
+  IMAGE_NAME: sentiment-mlops
+  CONTAINER_NAME: sentiment-mlops
+  APP_PORT: "5000"
+
+jobs:
+
+  # ============================================================
+  # 1. PYTHON TESTS
+  # ============================================================
+  python-test:
+    name: 1 - Python Tests
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python 3.10
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run tests
+        env:
+          TESTING: "true"
+        run: |
+          python -m pytest -v
+
+
+  # ============================================================
+  # 2. DOCKER BUILD + LOCAL TEST
+  # ============================================================
+  docker-test:
+    name: 2 - Docker Build and Test
+    needs: python-test
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build Docker image
+        run: |
+          docker build --pull -t "$IMAGE_NAME:test" .
+
+      - name: Start Docker container
+        run: |
+          docker run -d             --name "$CONTAINER_NAME"             -p "$APP_PORT:$APP_PORT"             "$IMAGE_NAME:test"
+
+      - name: Wait for application health
+        shell: bash
+        run: |
+          echo "Waiting for Flask/Gunicorn..."
+
+          for i in {1..60}; do
+            if curl -fsS "http://127.0.0.1:$APP_PORT/health"; then
+              echo ""
+              echo "Application is healthy."
+              exit 0
+            fi
+
+            echo "Waiting... attempt $i/60"
+            sleep 3
+          done
+
+          echo "Application did not become healthy."
+          docker ps -a
+          docker logs "$CONTAINER_NAME" || true
+          exit 1
+
+      - name: Test health endpoint
+        run: |
+          curl --fail --show-error --silent             "http://127.0.0.1:$APP_PORT/health"
+          echo ""
+
+      - name: Test home endpoint
+        run: |
+          curl --fail --show-error --silent             "http://127.0.0.1:$APP_PORT/"
+          echo ""
+
+      - name: Show container logs
+        if: always()
+        run: |
+          docker logs "$CONTAINER_NAME" || true
+
+      - name: Cleanup container
+        if: always()
+        run: |
+          docker stop "$CONTAINER_NAME" || true
+          docker rm "$CONTAINER_NAME" || true
+
+
+  # ============================================================
+  # 3. AWS ECR BUILD + PUSH
+  # ============================================================
+  ecr-push:
+    name: 3 - Build and Push Image to Amazon ECR
+    needs: docker-test
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Verify AWS identity
+        run: |
+          echo "AWS region: $AWS_REGION"
+          aws sts get-caller-identity
+
+      - name: Create ECR repository if it does not exist
+        run: |
+          if aws ecr describe-repositories             --repository-names "$ECR_REPOSITORY"             --region "$AWS_REGION" >/dev/null 2>&1
+          then
+            echo "ECR repository already exists: $ECR_REPOSITORY"
+          else
+            echo "Creating ECR repository: $ECR_REPOSITORY"
+
+            aws ecr create-repository               --repository-name "$ECR_REPOSITORY"               --region "$AWS_REGION"
+
+            echo "ECR repository created."
+          fi
+
+      - name: Login to Amazon ECR
+        id: ecr-login
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build ECR Docker image
+        env:
+          REGISTRY: ${{ steps.ecr-login.outputs.registry }}
+        run: |
+          echo "Registry: $REGISTRY"
+
+          docker build --pull             -t "$REGISTRY/$ECR_REPOSITORY:latest"             -t "$REGISTRY/$ECR_REPOSITORY:${GITHUB_SHA}"             .
+
+      - name: Verify Docker image
+        env:
+          REGISTRY: ${{ steps.ecr-login.outputs.registry }}
+        run: |
+          docker image inspect             "$REGISTRY/$ECR_REPOSITORY:latest" >/dev/null
+
+          echo "Docker image is valid."
+
+      - name: Push latest image
+        env:
+          REGISTRY: ${{ steps.ecr-login.outputs.registry }}
+        run: |
+          docker push             "$REGISTRY/$ECR_REPOSITORY:latest"
+
+      - name: Push commit image
+        env:
+          REGISTRY: ${{ steps.ecr-login.outputs.registry }}
+        run: |
+          docker push             "$REGISTRY/$ECR_REPOSITORY:${GITHUB_SHA}"
+
+      - name: Verify ECR images
+        run: |
+          aws ecr describe-images             --repository-name "$ECR_REPOSITORY"             --region "$AWS_REGION"
+
+          echo ""
+          echo "ECR PUSH SUCCESSFUL."
+
+
+  # ============================================================
+  # 4. DEPLOY TO AWS EC2
+  # ============================================================
+  deploy-ec2:
+    name: 4 - Deploy Docker Image to EC2
+    needs: ecr-push
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Validate EC2 secrets
+        env:
+          EC2_HOST: ${{ secrets.EC2_HOST }}
+          EC2_USER: ${{ secrets.EC2_USER }}
+          EC2_SSH_KEY: ${{ secrets.EC2_SSH_KEY }}
+        run: |
+          if [ -z "$EC2_HOST" ]; then
+            echo "ERROR: EC2_HOST secret is empty."
+            exit 1
+          fi
+
+          if [ -z "$EC2_USER" ]; then
+            echo "ERROR: EC2_USER secret is empty."
+            exit 1
+          fi
+
+          if [ -z "$EC2_SSH_KEY" ]; then
+            echo "ERROR: EC2_SSH_KEY secret is empty."
+            exit 1
+          fi
+
+          echo "EC2 secrets are configured."
+
+      - name: Configure SSH
+        env:
+          EC2_HOST: ${{ secrets.EC2_HOST }}
+          EC2_SSH_KEY: ${{ secrets.EC2_SSH_KEY }}
+        run: |
+          mkdir -p ~/.ssh
+
+          printf '%s\n' "$EC2_SSH_KEY" > ~/.ssh/ec2_key.pem
+          chmod 600 ~/.ssh/ec2_key.pem
+
+          ssh-keyscan -H "$EC2_HOST" >> ~/.ssh/known_hosts
+
+      - name: Test SSH connection
+        env:
+          EC2_HOST: ${{ secrets.EC2_HOST }}
+          EC2_USER: ${{ secrets.EC2_USER }}
+        run: |
+          ssh             -i ~/.ssh/ec2_key.pem             -o BatchMode=yes             -o ConnectTimeout=20             "$EC2_USER@$EC2_HOST"             "echo EC2 SSH connection successful"
+
+      - name: Deploy ECR image to EC2
+        env:
+          EC2_HOST: ${{ secrets.EC2_HOST }}
+          EC2_USER: ${{ secrets.EC2_USER }}
+        run: |
+          ssh             -i ~/.ssh/ec2_key.pem             -o BatchMode=yes             -o ConnectTimeout=20             "$EC2_USER@$EC2_HOST" 'bash -s' <<'REMOTE_SCRIPT'
+
+          set -euo pipefail
+
+          AWS_REGION="ap-south-1"
+          ECR_REPOSITORY="sentiment-mlops"
+          IMAGE_TAG="latest"
+          CONTAINER_NAME="sentiment-mlops"
+          APP_PORT="5000"
+
+          echo "=========================================="
+          echo " SENTIMENT MLOPS EC2 DEPLOYMENT"
+          echo "=========================================="
+
+          echo ""
+          echo "1. Check Docker"
+          docker --version
+
+          echo ""
+          echo "2. Check AWS CLI"
+          aws --version
+
+          echo ""
+          echo "3. Check EC2 IAM identity"
+          aws sts get-caller-identity
+
+          echo ""
+          echo "4. Login to Amazon ECR"
+
+          AWS_ACCOUNT_ID=$(aws sts get-caller-identity             --query Account             --output text)
+
+          ECR_REGISTRY="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
+
+          aws ecr get-login-password             --region "$AWS_REGION"             | docker login               --username AWS               --password-stdin "$ECR_REGISTRY"
+
+          echo ""
+          echo "5. Pull latest image"
+
+          docker pull             "$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG"
+
+          echo ""
+          echo "6. Stop old container"
+
+          docker stop "$CONTAINER_NAME" 2>/dev/null || true
+
+          echo ""
+          echo "7. Remove old container"
+
+          docker rm "$CONTAINER_NAME" 2>/dev/null || true
+
+          echo ""
+          echo "8. Start new container"
+
+          docker run -d             --name "$CONTAINER_NAME"             --restart unless-stopped             -p "$APP_PORT:$APP_PORT"             "$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG"
+
+          echo ""
+          echo "9. Wait for application"
+
+          for i in {1..40}; do
+
+            if curl -fsS "http://127.0.0.1:$APP_PORT/health"; then
+              echo ""
+              echo "Application health check successful."
+              break
+            fi
+
+            echo "Waiting for application... $i/40"
+            sleep 3
+
+            if [ "$i" -eq 40 ]; then
+              echo "ERROR: Application health check failed."
+              docker ps -a
+              docker logs "$CONTAINER_NAME" || true
+              exit 1
+            fi
+
+          done
+
+          echo ""
+          echo "10. Docker container status"
+
+          docker ps --filter "name=$CONTAINER_NAME"
+
+          echo ""
+          echo "11. Application logs"
+
+          docker logs --tail 50 "$CONTAINER_NAME"
+
+          echo ""
+          echo "=========================================="
+          echo " EC2 DEPLOYMENT SUCCESSFUL"
+          echo "=========================================="
+
+          REMOTE_SCRIPT
+
+      - name: Final success
+        run: |
+          echo ""
+          echo "=========================================="
+          echo " SENTIMENT MLOPS CI/CD SUCCESSFUL"
+          echo "=========================================="
+          echo "AWS Region : $AWS_REGION"
+          echo "Target     : EC2"
+          echo "ECR        : $ECR_REPOSITORY"
+          echo "Container  : $CONTAINER_NAME"
+          echo "Port       : $APP_PORT"
+          echo "=========================================="
